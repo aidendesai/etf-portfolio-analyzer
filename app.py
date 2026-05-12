@@ -6,12 +6,12 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import yfinance as yf
 import plotly.graph_objects as go
 import re
 import io
 import base64
 import time
+import datetime
 from io import StringIO
 
 st.set_page_config(page_title="ETF Holdings Analyzer", page_icon="📊", layout="wide")
@@ -23,12 +23,10 @@ SCRAPE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
-
-# yfinance reuses this session — custom User-Agent reduces rate-limit risk
-YF_SESSION = requests.Session()
-YF_SESSION.headers.update(SCRAPE_HEADERS)
 
 SECTOR_COLORS = {
     "Technology": "#4C72B0",
@@ -67,25 +65,47 @@ def _get(url: str) -> requests.Response | None:
         return None
 
 
-def _yf_history(ticker: str, period: str, interval: str) -> pd.DataFrame | None:
-    """yfinance history with up to 3 retries on rate-limit."""
+# ── Yahoo Finance v8 range API (no crumb / no auth needed) ────────────────────
+#
+# Using ?range=1mo&interval=1d is a different code path from the old
+# ?period1=...&period2=...&crumb=... approach.  No session management,
+# no cookies, no API key — just a plain GET.
+
+def _yf_range_fetch(ticker: str, range_: str, interval: str) -> pd.DataFrame | None:
+    """Fetch price history via Yahoo Finance v8 range endpoint (free, unauthenticated)."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {"range": range_, "interval": interval, "includePrePost": "false"}
     for attempt in range(3):
         try:
-            hist = yf.Ticker(ticker, session=YF_SESSION).history(
-                period=period, interval=interval, auto_adjust=True
-            )
-            return hist if not hist.empty else None
-        except Exception as e:
-            msg = str(e).lower()
-            if "rate" in msg or "429" in msg or "too many" in msg:
+            r = requests.get(url, params=params, headers=SCRAPE_HEADERS, timeout=15)
+            if r.status_code == 429:
                 if attempt < 2:
-                    time.sleep(2 ** attempt)
+                    time.sleep(2 ** attempt + 1)
+                continue
+            if r.status_code != 200:
+                return None
+            result = r.json().get("chart", {}).get("result", [])
+            if not result:
+                return None
+            rc = result[0]
+            timestamps = rc.get("timestamp", [])
+            adjclose = rc.get("indicators", {}).get("adjclose", [])
+            if adjclose and "adjclose" in adjclose[0]:
+                closes = adjclose[0]["adjclose"]
             else:
-                break
+                closes = rc.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+            if not timestamps or not closes:
+                return None
+            idx = pd.to_datetime(timestamps, unit="s", utc=True)
+            df = pd.DataFrame({"Close": closes}, index=idx).dropna()
+            return df if not df.empty else None
+        except Exception:
+            if attempt < 2:
+                time.sleep(1)
     return None
 
 
-# ── Stockanalysis.com scrapers (sector/industry/ETF info/holdings) ─────────────
+# ── Stockanalysis.com scrapers ─────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_etf_info(ticker: str) -> dict:
@@ -140,7 +160,6 @@ def get_stock_meta(ticker: str) -> dict:
         for el in soup.find_all("span", class_=lambda c: c and "font-semibold" in c):
             label = el.get_text(strip=True)
             if label in ("Sector", "Industry"):
-                # Value is either the next sibling or an <a> inside the parent div
                 sibling = el.find_next_sibling()
                 val = sibling.get_text(strip=True) if sibling else None
                 if not val:
@@ -160,7 +179,6 @@ def get_stock_meta(ticker: str) -> dict:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def classify_ticker(ticker: str) -> str:
-    """Returns 'etf' or 'stock'."""
     resp = _get(f"https://stockanalysis.com/etf/{ticker.lower()}/holdings/")
     if resp is None:
         return "stock"
@@ -175,9 +193,9 @@ def classify_ticker(ticker: str) -> str:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_current_price(ticker: str) -> float | None:
-    hist = _yf_history(ticker, "5d", "1d")
-    if hist is not None and not hist.empty:
-        return float(hist["Close"].iloc[-1])
+    df = _yf_range_fetch(ticker, "5d", "1d")
+    if df is not None and not df.empty:
+        return float(df["Close"].iloc[-1])
     return None
 
 
@@ -196,35 +214,23 @@ def get_stock_name(ticker: str) -> str:
     return ticker
 
 
-# ── yfinance price fetchers ───────────────────────────────────────────────────
+# ── Price fetchers ────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_price_history(ticker: str, period: str, interval: str) -> pd.DataFrame | None:
-    return _yf_history(ticker, period, interval)
+    return _yf_range_fetch(ticker, period, interval)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_stock_prices_batch(tickers: tuple) -> pd.DataFrame | None:
     if not tickers:
         return None
-    for attempt in range(3):
-        try:
-            data = yf.download(
-                list(tickers), period="1y", interval="1d",
-                auto_adjust=True, progress=False,
-                session=YF_SESSION, multi_level_index=True,
-            )
-            if data.empty:
-                return None
-            close = data["Close"]
-            return close.to_frame(tickers[0]) if isinstance(close, pd.Series) else close
-        except Exception as e:
-            msg = str(e).lower()
-            if ("rate" in msg or "429" in msg or "too many" in msg) and attempt < 2:
-                time.sleep(2 ** attempt)
-            else:
-                break
-    return None
+    results: dict = {}
+    for ticker in tickers:
+        df = _yf_range_fetch(ticker, "1y", "1d")
+        if df is not None:
+            results[ticker] = df["Close"]
+    return pd.DataFrame(results) if results else None
 
 
 # ── Normalisation ──────────────────────────────────────────────────────────────
@@ -348,7 +354,6 @@ def make_etf_chart(hist: pd.DataFrame, ticker: str, period: str) -> go.Figure:
 def make_compare_chart(
     hist_a: pd.DataFrame, hist_b: pd.DataFrame, ta: str, tb: str
 ) -> go.Figure:
-    """Both ETFs indexed to 100 at the start of the period."""
     pa = hist_a["Close"]
     pb = hist_b["Close"]
     na = (pa / pa.iloc[0]) * 100
@@ -382,16 +387,29 @@ def make_compare_chart(
     return fig
 
 
-# ── Holdings bar / donut charts ───────────────────────────────────────────────
+# ── Holdings bar chart ────────────────────────────────────────────────────────
 
 def make_bar_chart(df: pd.DataFrame) -> go.Figure:
     bar = df.head(25).copy()
     bar["Label"] = bar.apply(lambda r: r["Symbol"] if r["Symbol"] else r["Name"][:20], axis=1)
+
+    has_industry = "Industry" in bar.columns
+    hover = (
+        "<b>%{y}</b><br>Weight: %{x:.2f}%<br>Sector: %{customdata[0]}"
+        + ("<br>Industry: %{customdata[1]}" if has_industry else "")
+        + "<extra></extra>"
+    )
+    custom = (
+        list(zip(bar["Sector"], bar["Industry"])) if has_industry
+        else list(zip(bar["Sector"],))
+    )
+
     fig = go.Figure(go.Bar(
         x=bar["Weight"], y=bar["Label"],
         orientation="h",
         marker_color=[SECTOR_COLORS.get(s, "#CCCCCC") for s in bar["Sector"]],
-        hovertemplate="<b>%{y}</b><br>Weight: %{x:.2f}%<extra></extra>",
+        customdata=custom,
+        hovertemplate=hover,
     ))
     fig.update_layout(
         yaxis=dict(autorange="reversed", tickfont=dict(size=11)),
@@ -404,23 +422,94 @@ def make_bar_chart(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def make_donut(df: pd.DataFrame) -> go.Figure:
+# ── Sector donut + industry drill-down ────────────────────────────────────────
+
+def make_sector_donut(df: pd.DataFrame) -> go.Figure:
+    """Clean donut showing sector weights only."""
     agg = df.groupby("Sector")["Weight"].sum().reset_index().sort_values("Weight", ascending=False)
     fig = go.Figure(go.Pie(
         labels=agg["Sector"],
         values=agg["Weight"].round(2),
         marker_colors=[SECTOR_COLORS.get(s, "#CCCCCC") for s in agg["Sector"]],
-        hole=0.4, textinfo="label+percent",
+        hole=0.42,
+        textinfo="label+percent",
         hovertemplate="<b>%{label}</b><br>%{value:.2f}%<extra></extra>",
+        sort=False,
     ))
-    fig.update_layout(showlegend=False,
-                      margin=dict(l=0, r=0, t=10, b=0),
-                      height=400, paper_bgcolor="rgba(0,0,0,0)")
+    fig.update_layout(
+        showlegend=False,
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=380,
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
     return fig
+
+
+def make_industry_bar(df: pd.DataFrame, sector: str) -> go.Figure:
+    """Horizontal bar chart of industry breakdown within a sector."""
+    sub = df[df["Sector"] == sector]
+    agg = (
+        sub.groupby("Industry")["Weight"]
+        .sum()
+        .reset_index()
+        .sort_values("Weight", ascending=False)
+    )
+    color = SECTOR_COLORS.get(sector, "#CCCCCC")
+    fig = go.Figure(go.Bar(
+        x=agg["Weight"].round(2),
+        y=agg["Industry"],
+        orientation="h",
+        marker_color=color,
+        hovertemplate="<b>%{y}</b><br>%{x:.2f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        yaxis=dict(autorange="reversed"),
+        xaxis=dict(title="Weight (%)"),
+        title=dict(text=f"{sector} — Industry Mix", font=dict(size=13)),
+        margin=dict(l=0, r=20, t=40, b=30),
+        height=max(180, len(agg) * 38 + 70),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+def render_sector_breakdown(df: pd.DataFrame, selectbox_key: str) -> None:
+    """Donut for sectors + selectbox to drill into industry mix."""
+    st.plotly_chart(make_sector_donut(df), use_container_width=True)
+    sectors = (
+        df.groupby("Sector")["Weight"].sum()
+        .reset_index()
+        .sort_values("Weight", ascending=False)["Sector"]
+        .tolist()
+    )
+    chosen = st.selectbox(
+        "Select a sector to see its industry breakdown:",
+        options=["—"] + sectors,
+        key=selectbox_key,
+    )
+    if chosen != "—":
+        st.plotly_chart(make_industry_bar(df, chosen), use_container_width=True)
 
 
 def sector_agg(df: pd.DataFrame) -> pd.DataFrame:
     return df.groupby("Sector")["Weight"].sum().reset_index()
+
+
+def _industry_hover_text(df: pd.DataFrame, sectors: list[str]) -> list[str]:
+    """Build per-sector industry breakdown strings for grouped bar chart hover."""
+    if "Industry" not in df.columns:
+        return ["" for _ in sectors]
+    ind_agg = df.groupby(["Sector", "Industry"])["Weight"].sum().reset_index()
+    result = []
+    for sec in sectors:
+        rows = ind_agg[ind_agg["Sector"] == sec].sort_values("Weight", ascending=False)
+        if rows.empty:
+            result.append("")
+        else:
+            lines = "<br>".join(f"  {r['Industry']}: {r['Weight']:.1f}%" for _, r in rows.iterrows())
+            result.append(lines)
+    return result
 
 
 # ── Shared data pipeline ───────────────────────────────────────────────────────
@@ -438,7 +527,6 @@ def load_etf(ticker: str, top_n: int, progress_label: str = "") -> tuple[dict, p
     symbols = display["Symbol"].tolist()
     prefix = f"{progress_label}: " if progress_label else ""
 
-    # Sector + industry (stockanalysis.com, no rate-limit risk)
     bar = st.progress(0, text=f"{prefix}Looking up sector & industry…")
     sectors, industries = [], []
     for i, sym in enumerate(symbols):
@@ -451,7 +539,6 @@ def load_etf(ticker: str, top_n: int, progress_label: str = "") -> tuple[dict, p
     display["Sector"]   = sectors
     display["Industry"] = industries
 
-    # 1Y sparklines (yfinance batch, may be unavailable if rate-limited)
     valid_syms = tuple(s for s in symbols if s and str(s) not in ("", "nan", "N/A"))
     price_df = fetch_stock_prices_batch(valid_syms) if valid_syms else None
 
@@ -475,7 +562,7 @@ def load_etf(ticker: str, top_n: int, progress_label: str = "") -> tuple[dict, p
 def run_portfolio_analysis(
     tickers: list[str],
     amounts: list[float],
-    input_type: str,          # "usd" | "shares" | "pct"
+    input_type: str,
 ) -> dict | None:
     # ── Step 1: portfolio weights ──────────────────────────────────────────────
     if input_type == "shares":
@@ -496,7 +583,7 @@ def run_portfolio_analysis(
     weights = [a / total * 100 for a in amounts_w]
 
     # ── Step 2: classify + aggregate ──────────────────────────────────────────
-    exposure: dict[str, dict] = {}   # sym → {name, total, sources}
+    exposure: dict[str, dict] = {}
     summary_rows: list[dict]  = []
     coverage_notes: list[str] = []
 
@@ -581,7 +668,7 @@ def run_portfolio_analysis(
     exp_df["Sector"]   = exp_df["Symbol"].map(lambda s: sec_map.get(s, "Unknown"))
     exp_df["Industry"] = exp_df["Symbol"].map(lambda s: ind_map.get(s, "Unknown"))
 
-    # ── Step 5: sparklines for top stocks ─────────────────────────────────────
+    # ── Step 5: sparklines ────────────────────────────────────────────────────
     valid_syms = tuple(s for s in top_syms if s and str(s) not in ("", "nan"))
     price_df   = fetch_stock_prices_batch(valid_syms) if valid_syms else None
 
@@ -622,7 +709,7 @@ def render_price_section(ticker: str, period_key: str) -> None:
     hist = fetch_price_history(ticker, p, iv)
 
     if hist is None or hist.empty:
-        st.info("Price chart unavailable — Yahoo Finance is temporarily rate-limited. "
+        st.info("Price chart unavailable — data is temporarily unavailable. "
                 "Try again in a few minutes.")
         return
 
@@ -646,9 +733,9 @@ def render_holdings_table(df: pd.DataFrame, ticker: str) -> None:
 
     col_config = {
         "Symbol":   st.column_config.TextColumn("Symbol",   width="small"),
-        "Name":     st.column_config.TextColumn("Company",  width="large"),
+        "Name":     st.column_config.TextColumn("Company",  width="medium"),
         "Weight":   st.column_config.TextColumn("Weight",   width="small"),
-        "Sector":   st.column_config.TextColumn("Sector",   width="medium"),
+        "Sector":   st.column_config.TextColumn("Sector",   width="small"),
         "Industry": st.column_config.TextColumn("Industry", width="medium"),
     }
     if "1Y Chart" in styled.columns:
@@ -717,8 +804,9 @@ with tab_single:
                 st.subheader("Concentration by Holding")
                 st.plotly_chart(make_bar_chart(df), use_container_width=True)
             with ch2:
-                st.subheader("Sector Breakdown")
-                st.plotly_chart(make_donut(df), use_container_width=True)
+                st.subheader("Sector & Industry Breakdown")
+                st.caption("Select a sector below to see its industry mix.")
+                render_sector_breakdown(df, "s_sector_select")
 
             agg = sector_agg(df)
             top5, top10 = df["Weight"].head(5).sum(), df["Weight"].head(10).sum()
@@ -781,7 +869,11 @@ with tab_compare:
                 tb:   [info_b["name"], info_b["aum"] or "N/A",
                        info_b["expense_ratio"] or "N/A", info_b["num_holdings"] or "N/A"],
             }).set_index("")
-            st.dataframe(overview, use_container_width=True)
+            st.dataframe(overview, use_container_width=True,
+                         column_config={
+                             ta: st.column_config.TextColumn(ta, width="medium"),
+                             tb: st.column_config.TextColumn(tb, width="medium"),
+                         })
 
             st.divider()
 
@@ -789,14 +881,13 @@ with tab_compare:
             st.subheader("Price Performance")
             cmp_period = st.radio(
                 "Period", list(PERIOD_MAP.keys()),
-                horizontal=True, key="c_period", index=5,   # default 1Y
+                horizontal=True, key="c_period", index=4,   # default 1Y
             )
             cp, civ = PERIOD_MAP[cmp_period]
             hist_a = fetch_price_history(ta, cp, civ)
             hist_b = fetch_price_history(tb, cp, civ)
 
             if hist_a is not None and hist_b is not None:
-                # Current prices + period returns as metrics
                 pm1, pm2 = st.columns(2)
                 with pm1:
                     cur_a  = hist_a["Close"].iloc[-1]
@@ -815,7 +906,7 @@ with tab_compare:
                     use_container_width=True,
                 )
             else:
-                st.info("Price chart unavailable — Yahoo Finance is temporarily rate-limited. "
+                st.info("Price chart unavailable — data is temporarily unavailable. "
                         "Try again in a few minutes.")
 
             st.divider()
@@ -833,7 +924,8 @@ with tab_compare:
             st.divider()
 
             # ── Sector comparison ──────────────────────────────────────────────
-            st.subheader("Sector Breakdown")
+            st.subheader("Sector & Industry Breakdown")
+            st.caption("Hover over bars to see industry detail within each sector.")
             agg_a = sector_agg(df_a).rename(columns={"Weight": ta})
             agg_b = sector_agg(df_b).rename(columns={"Weight": tb})
             msec  = (
@@ -841,16 +933,28 @@ with tab_compare:
                 .fillna(0)
                 .sort_values(ta, ascending=False)
             )
+            sector_list = msec["Sector"].tolist()
+            ind_hover_a = _industry_hover_text(df_a, sector_list)
+            ind_hover_b = _industry_hover_text(df_b, sector_list)
+
             fig_sec = go.Figure()
             fig_sec.add_trace(go.Bar(
                 name=ta, x=msec["Sector"], y=msec[ta].round(2),
                 marker_color="#4C72B0",
-                hovertemplate="<b>%{x}</b><br>" + ta + ": %{y:.2f}%<extra></extra>",
+                customdata=[[t] for t in ind_hover_a],
+                hovertemplate=(
+                    "<b>%{x}</b><br>" + ta + ": %{y:.2f}%"
+                    "<br><br><b>Industries:</b><br>%{customdata[0]}<extra></extra>"
+                ),
             ))
             fig_sec.add_trace(go.Bar(
                 name=tb, x=msec["Sector"], y=msec[tb].round(2),
                 marker_color="#C44E52",
-                hovertemplate="<b>%{x}</b><br>" + tb + ": %{y:.2f}%<extra></extra>",
+                customdata=[[t] for t in ind_hover_b],
+                hovertemplate=(
+                    "<b>%{x}</b><br>" + tb + ": %{y:.2f}%"
+                    "<br><br><b>Industries:</b><br>%{customdata[0]}<extra></extra>"
+                ),
             ))
             fig_sec.update_layout(
                 barmode="group",
@@ -867,7 +971,11 @@ with tab_compare:
             sec_tbl = msec.copy()
             sec_tbl[ta] = sec_tbl[ta].map(lambda x: f"{x:.2f}%")
             sec_tbl[tb] = sec_tbl[tb].map(lambda x: f"{x:.2f}%")
-            st.dataframe(sec_tbl.set_index("Sector"), use_container_width=True)
+            st.dataframe(sec_tbl.set_index("Sector"), use_container_width=True,
+                         column_config={
+                             ta: st.column_config.TextColumn(ta, width="small"),
+                             tb: st.column_config.TextColumn(tb, width="small"),
+                         })
 
             st.divider()
 
@@ -892,7 +1000,6 @@ with tab_compare:
                 overlap = overlap.sort_values("Combined Weight", ascending=False).reset_index(drop=True)
                 overlap.index += 1
 
-                # Pull sparklines from whichever ETF has them
                 charts_a = df_a.set_index("Symbol")["1Y Chart"].to_dict() if "1Y Chart" in df_a.columns else {}
                 charts_b = df_b.set_index("Symbol")["1Y Chart"].to_dict() if "1Y Chart" in df_b.columns else {}
                 overlap["1Y Chart"] = overlap["Symbol"].map(lambda s: {**charts_b, **charts_a}.get(s))
@@ -902,12 +1009,12 @@ with tab_compare:
                     disp_ov[col] = disp_ov[col].map(lambda x: f"{x:.2f}%")
 
                 ov_col_cfg = {
-                    "Symbol":               st.column_config.TextColumn("Symbol",  width="small"),
-                    "Name":                 st.column_config.TextColumn("Company", width="large"),
-                    f"Weight in {ta}":      st.column_config.TextColumn(f"Weight in {ta}", width="small"),
-                    f"Weight in {tb}":      st.column_config.TextColumn(f"Weight in {tb}", width="small"),
-                    "Combined Weight":      st.column_config.TextColumn("Combined Weight", width="small"),
-                    "1Y Chart":             st.column_config.ImageColumn("1Y Trend", width="medium"),
+                    "Symbol":               st.column_config.TextColumn("Symbol",          width="small"),
+                    "Name":                 st.column_config.TextColumn("Company",         width="medium"),
+                    f"Weight in {ta}":      st.column_config.TextColumn(f"Wt {ta}",        width="small"),
+                    f"Weight in {tb}":      st.column_config.TextColumn(f"Wt {tb}",        width="small"),
+                    "Combined Weight":      st.column_config.TextColumn("Combined",        width="small"),
+                    "1Y Chart":             st.column_config.ImageColumn("1Y Trend",       width="medium"),
                 }
                 st.dataframe(disp_ov, use_container_width=True, column_config=ov_col_cfg)
 
@@ -943,7 +1050,6 @@ with tab_portfolio:
         "% of Portfolio":    "% of Portfolio",
     }[p_type_label]
 
-    # ── Current holdings ───────────────────────────────────────────────────────
     st.markdown("**Current Holdings**")
     starter_df = pd.DataFrame({"Ticker": [""] * 6, "Amount": [0.0] * 6})
     portfolio_input = st.data_editor(
@@ -959,7 +1065,6 @@ with tab_portfolio:
         key="p_editor",
     )
 
-    # ── Proposed additions ─────────────────────────────────────────────────────
     st.markdown("**Simulate Adding (optional)** — leave blank to skip")
     sim_starter = pd.DataFrame({"Ticker": [""] * 3, "Amount": [0.0] * 3})
     sim_input = st.data_editor(
@@ -1024,12 +1129,11 @@ with tab_portfolio:
 
     # ── Results ────────────────────────────────────────────────────────────────
     if "portfolio_result" in st.session_state and st.session_state.portfolio_result:
-        res      = st.session_state.portfolio_result
-        exp_df   = res["exposure_df"]
-        summary  = res["portfolio_summary"]
+        res       = st.session_state.portfolio_result
+        exp_df    = res["exposure_df"]
+        summary   = res["portfolio_summary"]
         cov_notes = res["coverage_notes"]
 
-        # Portfolio summary table
         st.divider()
         st.subheader("Portfolio Summary")
         sum_display = summary.copy()
@@ -1038,14 +1142,13 @@ with tab_portfolio:
             sum_display,
             use_container_width=True,
             column_config={
-                "Ticker":           st.column_config.TextColumn("Ticker",   width="small"),
-                "Name":             st.column_config.TextColumn("Name",     width="large"),
-                "Portfolio Weight": st.column_config.TextColumn("Weight",   width="small"),
-                "Amount":           st.column_config.NumberColumn("Amount", width="medium", format="%.2f"),
+                "Ticker":           st.column_config.TextColumn("Ticker",  width="small"),
+                "Name":             st.column_config.TextColumn("Name",    width="medium"),
+                "Portfolio Weight": st.column_config.TextColumn("Weight",  width="small"),
+                "Amount":           st.column_config.NumberColumn("Amount",width="small", format="%.2f"),
             },
         )
 
-        # ETF coverage note
         if cov_notes:
             with st.expander("ℹ️ ETF holdings coverage"):
                 st.caption(
@@ -1055,7 +1158,6 @@ with tab_portfolio:
                 for note in cov_notes:
                     st.markdown(f"- {note}")
 
-        # Aggregate exposure table
         st.divider()
         st.subheader(f"Aggregate Stock Exposure — {len(exp_df)} positions")
         st.caption(
@@ -1068,12 +1170,12 @@ with tab_portfolio:
         exp_display["Total Exposure"] = exp_display["Total Exposure"].map(lambda x: f"{x:.2f}%")
 
         exp_col_cfg: dict = {
-            "Symbol":         st.column_config.TextColumn("Symbol",    width="small"),
-            "Name":           st.column_config.TextColumn("Company",   width="large"),
-            "Total Exposure": st.column_config.TextColumn("Exposure",  width="small"),
-            "Breakdown":      st.column_config.TextColumn("Sources",   width="large"),
-            "Sector":         st.column_config.TextColumn("Sector",    width="medium"),
-            "Industry":       st.column_config.TextColumn("Industry",  width="medium"),
+            "Symbol":         st.column_config.TextColumn("Symbol",   width="small"),
+            "Name":           st.column_config.TextColumn("Company",  width="medium"),
+            "Total Exposure": st.column_config.TextColumn("Exposure", width="small"),
+            "Breakdown":      st.column_config.TextColumn("Sources",  width="medium"),
+            "Sector":         st.column_config.TextColumn("Sector",   width="small"),
+            "Industry":       st.column_config.TextColumn("Industry", width="medium"),
         }
         if "1Y Chart" in exp_display.columns:
             exp_col_cfg["1Y Chart"] = st.column_config.ImageColumn("1Y Trend", width="medium")
@@ -1086,9 +1188,17 @@ with tab_portfolio:
             file_name="portfolio_exposure.csv", mime="text/csv",
         )
 
-        # Sector breakdown
         st.divider()
-        st.subheader("Aggregate Sector Breakdown")
+        st.subheader("Aggregate Sector & Industry Breakdown")
+        st.caption("Select a sector below to see its industry mix.")
+
+        sector_df = exp_df[["Sector", "Industry", "Total Exposure"]].rename(
+            columns={"Total Exposure": "Weight"}
+        )
+        render_sector_breakdown(sector_df, "p_sector_select")
+
+        st.divider()
+        st.subheader("Concentration Summary")
         sec_agg_p = (
             exp_df.groupby("Sector")["Total Exposure"]
             .sum()
@@ -1096,25 +1206,6 @@ with tab_portfolio:
             .rename(columns={"Total Exposure": "Weight"})
             .sort_values("Weight", ascending=False)
         )
-        fig_sec_p = go.Figure(go.Pie(
-            labels=sec_agg_p["Sector"],
-            values=sec_agg_p["Weight"].round(2),
-            marker_colors=[SECTOR_COLORS.get(s, "#CCCCCC") for s in sec_agg_p["Sector"]],
-            hole=0.4,
-            textinfo="label+percent",
-            hovertemplate="<b>%{label}</b><br>%{value:.2f}%<extra></extra>",
-        ))
-        fig_sec_p.update_layout(
-            showlegend=False,
-            margin=dict(l=0, r=0, t=10, b=0),
-            height=420,
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        st.plotly_chart(fig_sec_p, use_container_width=True)
-
-        # Concentration summary
-        st.divider()
-        st.subheader("Concentration Summary")
         top5_e  = exp_df["Total Exposure"].head(5).sum()
         top10_e = exp_df["Total Exposure"].head(10).sum()
         top_s   = sec_agg_p.iloc[0]
@@ -1124,72 +1215,17 @@ with tab_portfolio:
         pc3.metric("Largest sector",   f"{top_s['Sector']} ({top_s['Weight']:.1f}%)")
 
         # ════════════════════════════════════════════════════════════════════
-        # SIMULATION SECTION
+        # SIMULATION RESULTS
         # ════════════════════════════════════════════════════════════════════
-        st.divider()
-        st.subheader("Simulate New Investments")
-        st.caption(
-            "Add positions you're considering buying. The simulation merges them with your "
-            "current portfolio and shows exactly how your aggregate stock exposure shifts."
-        )
-
-        orig_type = st.session_state.get("p_orig_type", "usd")
-        sim_col_label = {
-            "usd":    "Market Value ($)",
-            "shares": "Shares Held",
-            "pct":    "% of Portfolio",
-        }.get(orig_type, "Amount")
-        st.caption(f"Amounts interpreted as: **{sim_col_label}** (same units as your portfolio)")
-
-        sim_starter = pd.DataFrame({"Ticker": [""] * 3, "Amount": [0.0] * 3})
-        sim_input = st.data_editor(
-            sim_starter,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "Ticker": st.column_config.TextColumn(
-                    "Ticker", help="ETF or stock symbol to simulate adding"
-                ),
-                "Amount": st.column_config.NumberColumn(
-                    sim_col_label, min_value=0, format="%.4f"
-                ),
-            },
-            key="sim_editor",
-        )
-
-        sim_btn = st.button("Run Simulation", type="secondary", key="sim_btn")
-
-        if sim_btn:
-            sim_clean = sim_input.copy()
-            sim_clean.columns = ["Ticker", "Amount"]
-            sim_clean["Ticker"] = sim_clean["Ticker"].astype(str).str.strip().str.upper()
-            sim_clean = sim_clean[(sim_clean["Ticker"].str.len() > 0) & (sim_clean["Amount"] > 0)]
-
-            if len(sim_clean) == 0:
-                st.warning("Add at least one proposed position with a positive amount.")
-            else:
-                orig_tickers = st.session_state.get("p_orig_tickers", [])
-                orig_amounts = st.session_state.get("p_orig_amounts", [])
-                all_tickers  = orig_tickers + sim_clean["Ticker"].tolist()
-                all_amounts  = orig_amounts + sim_clean["Amount"].tolist()
-
-                with st.spinner("Running simulation…"):
-                    sim_res = run_portfolio_analysis(
-                        tickers=all_tickers,
-                        amounts=all_amounts,
-                        input_type=orig_type,
-                    )
-                if sim_res:
-                    st.session_state.sim_result = sim_res
-
         if st.session_state.get("sim_result"):
             sim_res  = st.session_state.sim_result
             orig_res = st.session_state.portfolio_result
             sim_exp  = sim_res["exposure_df"].copy()
             orig_exp = orig_res["exposure_df"].copy()
 
-            # ── Simulated portfolio summary ────────────────────────────────
+            st.divider()
             st.subheader("Simulated Portfolio")
+
             n_new = len(sim_res["portfolio_summary"]) - len(orig_res["portfolio_summary"])
             sm1, sm2, sm3 = st.columns(3)
             sm1.metric("Original positions", len(orig_res["portfolio_summary"]))
@@ -1203,9 +1239,9 @@ with tab_portfolio:
                 use_container_width=True,
                 column_config={
                     "Ticker":           st.column_config.TextColumn("Ticker",  width="small"),
-                    "Name":             st.column_config.TextColumn("Name",    width="large"),
+                    "Name":             st.column_config.TextColumn("Name",    width="medium"),
                     "Portfolio Weight": st.column_config.TextColumn("Weight",  width="small"),
-                    "Amount":           st.column_config.NumberColumn("Amount",width="medium", format="%.2f"),
+                    "Amount":           st.column_config.NumberColumn("Amount",width="small", format="%.2f"),
                 },
             )
 
@@ -1223,18 +1259,16 @@ with tab_portfolio:
             comparison = comparison.sort_values("After", ascending=False).reset_index(drop=True)
             comparison.index += 1
 
-            # ── Key movers ─────────────────────────────────────────────────
-            new_pos     = comparison[comparison["Before"] == 0]
-            increased   = comparison[(comparison["Change"] > 0) & (comparison["Before"] > 0)]
-            diluted     = comparison[comparison["Change"] < 0]
+            new_pos   = comparison[comparison["Before"] == 0]
+            increased = comparison[(comparison["Change"] > 0) & (comparison["Before"] > 0)]
+            diluted   = comparison[comparison["Change"] < 0]
 
             km1, km2, km3 = st.columns(3)
-            km1.metric("New positions",    len(new_pos))
+            km1.metric("New positions",       len(new_pos))
             km2.metric("Increased positions", len(increased))
             km3.metric("Diluted positions",   len(diluted),
                        help="Existing holdings whose portfolio % shrank because new capital was added")
 
-            # Top 5 movers in each direction
             top_up   = comparison[comparison["Change"] > 0].nlargest(5, "Change")
             top_down = comparison[comparison["Change"] < 0].nsmallest(5, "Change")
 
@@ -1252,7 +1286,6 @@ with tab_portfolio:
                             st.markdown(f"- **{r['Symbol']}**: {r['Before']:.2f}% → {r['After']:.2f}% "
                                         f"({r['Change']:.2f}%)")
 
-            # ── Full exposure comparison table ─────────────────────────────
             st.subheader("Full Exposure Comparison")
             cmp_disp = comparison.copy()
             cmp_disp.index.name = "Rank"
@@ -1267,12 +1300,12 @@ with tab_portfolio:
 
             cmp_col_cfg: dict = {
                 "Symbol":  st.column_config.TextColumn("Symbol",  width="small"),
-                "Name":    st.column_config.TextColumn("Company", width="large"),
+                "Name":    st.column_config.TextColumn("Company", width="medium"),
                 "Before":  st.column_config.TextColumn("Before",  width="small"),
                 "After":   st.column_config.TextColumn("After",   width="small"),
                 "Change":  st.column_config.TextColumn("Change",  width="small"),
                 "Status":  st.column_config.TextColumn("",        width="small"),
-                "Sector":  st.column_config.TextColumn("Sector",  width="medium"),
+                "Sector":  st.column_config.TextColumn("Sector",  width="small"),
                 "Industry":st.column_config.TextColumn("Industry",width="medium"),
             }
             if "1Y Chart" in cmp_disp.columns:
