@@ -12,6 +12,7 @@ import io
 import base64
 import time
 import datetime
+import os
 from io import StringIO
 
 st.set_page_config(page_title="ETF Holdings Analyzer", page_icon="📊", layout="wide")
@@ -65,44 +66,119 @@ def _get(url: str) -> requests.Response | None:
         return None
 
 
-# ── Yahoo Finance v8 range API (no crumb / no auth needed) ────────────────────
-#
-# Using ?range=1mo&interval=1d is a different code path from the old
-# ?period1=...&period2=...&crumb=... approach.  No session management,
-# no cookies, no API key — just a plain GET.
+# ── Charles Schwab Market Data API ────────────────────────────────────────────
 
-def _yf_range_fetch(ticker: str, range_: str, interval: str) -> pd.DataFrame | None:
-    """Fetch price history via Yahoo Finance v8 range endpoint (free, unauthenticated)."""
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    params = {"range": range_, "interval": interval, "includePrePost": "false"}
-    for attempt in range(3):
-        try:
-            r = requests.get(url, params=params, headers=SCRAPE_HEADERS, timeout=15)
-            if r.status_code == 429:
-                if attempt < 2:
-                    time.sleep(2 ** attempt + 1)
-                continue
-            if r.status_code != 200:
-                return None
-            result = r.json().get("chart", {}).get("result", [])
-            if not result:
-                return None
-            rc = result[0]
-            timestamps = rc.get("timestamp", [])
-            adjclose = rc.get("indicators", {}).get("adjclose", [])
-            if adjclose and "adjclose" in adjclose[0]:
-                closes = adjclose[0]["adjclose"]
-            else:
-                closes = rc.get("indicators", {}).get("quote", [{}])[0].get("close", [])
-            if not timestamps or not closes:
-                return None
-            idx = pd.to_datetime(timestamps, unit="s", utc=True)
-            df = pd.DataFrame({"Close": closes}, index=idx).dropna()
-            return df if not df.empty else None
-        except Exception:
-            if attempt < 2:
-                time.sleep(1)
-    return None
+# (periodType, period, frequencyType, frequency) for each PERIOD_MAP key
+_SCHWAB_PARAMS: dict[str, tuple] = {
+    "1d":  ("day",   1, "minute", 5),
+    "5d":  ("day",   5, "minute", 30),
+    "1mo": ("month", 1, "daily",  1),
+    "3mo": ("month", 3, "daily",  1),
+    "6mo": ("month", 6, "daily",  1),
+    "1y":  ("year",  1, "daily",  1),
+    "5y":  ("year",  5, "weekly", 1),
+    "ytd": ("ytd",   1, "daily",  1),
+}
+
+_schwab_token_cache: dict = {"access_token": None, "expires_at": 0.0}
+
+
+def _schwab_credentials() -> tuple[str, str, str]:
+    try:
+        key    = st.secrets.get("SCHWAB_APP_KEY", "")
+        secret = st.secrets.get("SCHWAB_APP_SECRET", "")
+        rtoken = st.secrets.get("SCHWAB_REFRESH_TOKEN", "")
+    except Exception:
+        key    = os.environ.get("SCHWAB_APP_KEY", "")
+        secret = os.environ.get("SCHWAB_APP_SECRET", "")
+        rtoken = os.environ.get("SCHWAB_REFRESH_TOKEN", "")
+    return key, secret, rtoken
+
+
+def _schwab_access_token() -> str | None:
+    global _schwab_token_cache
+    if _schwab_token_cache["access_token"] and time.time() < _schwab_token_cache["expires_at"]:
+        return _schwab_token_cache["access_token"]
+    key, secret, rtoken = _schwab_credentials()
+    if not (key and secret and rtoken):
+        return None
+    try:
+        credentials = base64.b64encode(f"{key}:{secret}".encode()).decode()
+        r = requests.post(
+            "https://api.schwabapi.com/v1/oauth/token",
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={"grant_type": "refresh_token", "refresh_token": rtoken},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        _schwab_token_cache["access_token"] = data["access_token"]
+        _schwab_token_cache["expires_at"]   = time.time() + data.get("expires_in", 1800) - 60
+        return _schwab_token_cache["access_token"]
+    except Exception:
+        return None
+
+
+def _schwab_price_history(ticker: str, period: str, interval: str) -> pd.DataFrame | None:
+    token = _schwab_access_token()
+    if not token:
+        return None
+    params_tuple = _SCHWAB_PARAMS.get(period, ("year", 1, "daily", 1))
+    period_type, period_val, freq_type, freq_val = params_tuple
+    params: dict = {
+        "symbol":        ticker.upper(),
+        "periodType":    period_type,
+        "frequencyType": freq_type,
+        "frequency":     freq_val,
+        "needExtendedHoursData": "false",
+    }
+    if period_type != "ytd":
+        params["period"] = period_val
+    try:
+        r = requests.get(
+            "https://api.schwabapi.com/marketdata/v1/pricehistory",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if data.get("empty", True):
+            return None
+        candles = data.get("candles", [])
+        if not candles:
+            return None
+        idx = pd.to_datetime([c["datetime"] for c in candles], unit="ms")
+        df  = pd.DataFrame({"Close": [c["close"] for c in candles]}, index=idx).dropna()
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def _schwab_quote(ticker: str) -> float | None:
+    token = _schwab_access_token()
+    if not token:
+        return None
+    try:
+        r = requests.get(
+            "https://api.schwabapi.com/marketdata/v1/quotes",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"symbols": ticker.upper(), "fields": "quote"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        quote = data.get(ticker.upper(), {}).get("quote", {})
+        price = quote.get("lastPrice") or quote.get("closePrice")
+        return float(price) if price else None
+    except Exception:
+        return None
 
 
 # ── Stockanalysis.com scrapers ─────────────────────────────────────────────────
@@ -193,10 +269,7 @@ def classify_ticker(ticker: str) -> str:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_current_price(ticker: str) -> float | None:
-    df = _yf_range_fetch(ticker, "5d", "1d")
-    if df is not None and not df.empty:
-        return float(df["Close"].iloc[-1])
-    return None
+    return _schwab_quote(ticker)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -214,11 +287,11 @@ def get_stock_name(ticker: str) -> str:
     return ticker
 
 
-# ── Price fetchers ────────────────────────────────────────────────────────────
+# ── Price fetchers (Schwab) ───────────────────────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_price_history(ticker: str, period: str, interval: str) -> pd.DataFrame | None:
-    return _yf_range_fetch(ticker, period, interval)
+    return _schwab_price_history(ticker, period, interval)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -227,7 +300,7 @@ def fetch_stock_prices_batch(tickers: tuple) -> pd.DataFrame | None:
         return None
     results: dict = {}
     for ticker in tickers:
-        df = _yf_range_fetch(ticker, "1y", "1d")
+        df = _schwab_price_history(ticker, "1y", "1d")
         if df is not None:
             results[ticker] = df["Close"]
     return pd.DataFrame(results) if results else None
